@@ -1,13 +1,27 @@
-create or replace package pub_ds.job_log is
+create or replace package pub_ds.job_log_psv is
 
   -- Author  : andrey.grigoryev
   -- Created : 22.01.2015 18:32:45
-  -- Purpose : Логгирование ETL-процедур
+  -- Purpose : Логирование ETL-процедур
+
+-- Идентификатор текущего журнала
+P_LOG_ID           number(10) := null;
+p_Copy2dbms_output number     := 0;
 
 /*
 04.12.2015:
     1. Добавлена обработка вложенных вызовов start_log - они не создают новую запись в t_job_logs, а пишутся в детальный лог.
     2. Работа с таблицами обернута в Execute immediate, чтобы пакет не инвалидировался при изменении структуры таблиц.
+
+25/01/2017   Паршуков 
+    1. вынесен идентификатор журнала в спецификацию
+    2. удалена ф-ция "get_session_id". Замена на sys_context('userenv', 'sid');
+    3. из write_detail_log убран префикс в логе "'Вызван write_detail_log без start_log, текст комментария: '||", если вызов без start_log
+    4. исправлен Exception, который мог возникнуть при записи строки 4000 и более. Кроме того сейчас запишется вся строка, даже если превышает 4000
+    5. в write_detail_log добавлено dbms_application_info.set_client_info - чтобы было понятно, что сделал\делает сессия
+    6. в start_log\end_log добавлено dbms_application_info.set_action('jblg_jblg_id='||P_LOG_ID); Теперь по V$session можно сразу перейти в логи и посмотреть что за процесс и чем занимается
+    7. упростил get_filial_id и вернул в нее возможность указывать филиал
+    8. добавил p_Copy2dbms_output для целей отладки дублировать вывод в DBMS_OUTPUT
 */
 
 function get_filial_id(in_filial_id number) return number ;
@@ -25,12 +39,10 @@ procedure end_log_with_error(in_error varchar2);
 -- Запись в детальный лог
 procedure write_detail_log(in_comment_text varchar2, in_rows_processed number default(0));
 
-end job_log;
+end;
 /
-create or replace package body pub_ds.job_log is
+create or replace package body pub_ds.job_log_psv is
 
--- Идентификатор текущего журнала
-P_LOG_ID number(10) := null;
 
 -- Идентфикатор журнала ошибок логгирования
 P_LOG_ERROR_ID number(10) := -1;
@@ -38,6 +50,8 @@ P_LOG_ERROR_ID number(10) := -1;
 -- Счетчик уровней вложенности. Нужен, чтобы отслеживать вложенные вызовы start_log
 P_LOG_STACK_LEVEL number(10) := 0;
 
+
+-------------------------------------------------------------------------------------------------------------------------
 function get_package_log_level(in_owner varchar2, in_package_name varchar2) return number
 is
     result_ number;
@@ -58,43 +72,40 @@ begin
     return result_;
 end;
 
-function get_session_id return number
-is
-    result number;
-begin
-    select max(nvl(SID, 0))
-    into Result
-    from v$session
-    where audsid = USERENV('SESSIONID');
-    return(Result);
-end;
 
+-------------------------------------------------------------------------------------------------------------------------
 -- Определяем код филиала. Пытаемся определить по имени пользователя, если не получается, то возращаем то, что передали на вход, или 0, если на входе пусто
 function get_filial_id(in_filial_id number) return number
 is
     result_ number(10);
+    has_such_filial_ number(10);
 begin
     -- Находим код филиала по имени текущего пользователя. Используем execute immediate, чтобы пакет не инвалидировался при изменении структуры d_filials
     execute immediate '
-    select
-        max(t.filial_id)
-    from
-        pub_ds.d_filials t
-    where
-        t.ds_owner = user' into result_;
+    select max(t.filial_id)
+      from pub_ds.d_filials t
+     where t.ds_owner = user' into result_;
+    
+    execute immediate '
+    select max(case when filial_id=:f then filial_id else 0 end)
+      from pub_ds.d_filials t' 
+    into has_such_filial_ 
+    using in_filial_id;
 
-    if result_ is null and in_filial_id is not null then
+    /*if result_ is null and in_filial_id is not null then
         result_ := in_filial_id;
-    end if;
+    end if;*/
 
-    return nvl(result_,0);
+    return coalesce(result_, has_such_filial_, 0);/*nvl(result_,0)*/
 end;
 
 
+-------------------------------------------------------------------------------------------------------------------------
 procedure write_log_internal(in_log_id number, in_schema varchar2, in_package_name varchar2, in_comment_text varchar2, in_rows_processed number default(0))
 is
     pragma autonomous_transaction;
-    sid_ number(10);
+    l_writeRowCnt number :=0;
+    l_tmpStr varchar2(3999);
 begin
     -- Находим уровень логгирования для пакета
     -- Если запись в таблице есть, ничего не делаем и выходим
@@ -102,27 +113,34 @@ begin
         return;
     end if;
 
-
-    sid_ := get_session_id();
-
     -- Используем execute immediate, чтобы пакет не инвалидировался при изменении структуры таблицы
-    execute immediate '
-    insert into t_job_log_details(jldt_id, jblg_jblg_id, start_time, comment_text, rows_processed, sid)
-    values(
-        t_job_log_details_seq.nextval,
-        :in_log_id,
-        sysdate,
-        :in_comment_text,
-        :in_rows_processed,
-        :sid_
-    )'
-    using in_log_id, in_comment_text, in_rows_processed, sid_
-    ;
+    while (length(in_comment_text)/3999) > l_writeRowCnt 
+    loop
+			l_tmpStr := substr(in_comment_text, l_writeRowCnt*3999+1, 3999); 
+      if l_writeRowCnt=0 then 
+				 dbms_application_info.set_client_info(l_tmpStr);
+  		end if;
+      execute immediate '
+      insert into t_job_log_details(jldt_id, jblg_jblg_id, start_time, comment_text, rows_processed, sid)
+      values(
+          t_job_log_details_seq.nextval,
+          :in_log_id,
+          sysdate,
+          :in_comment_text,
+          :in_rows_processed,
+          :sid_
+      )'
+      using in_log_id, l_tmpStr, in_rows_processed, sys_context('userenv', 'sid');
+      l_writeRowCnt := l_writeRowCnt +1;
+      if p_Copy2dbms_output=1 then 
+        dbms_output.put_line(l_tmpStr);
+      end if;
+    end loop;
 
     commit;
 end;
 
-
+-------------------------------------------------------------------------------------------------------------------------
 procedure start_log(in_filial_id number default(null), in_procedure_name varchar2 default(null), in_comment_text varchar2)
 is
     pragma autonomous_transaction;
@@ -134,7 +152,6 @@ is
 
     procedure_name_part_ varchar2(400) := '';
     procedure_name_ varchar2(400);
-    sid_ number(10);
     filial_id_ number;
 begin
     -- Находим, кто вызывал процедуру
@@ -153,8 +170,6 @@ begin
         P_LOG_STACK_LEVEL := P_LOG_STACK_LEVEL + 1;
         return;
     end if;
-
-    sid_ := get_session_id();
 
     filial_id_ := get_filial_id(in_filial_id);
 
@@ -187,11 +202,16 @@ begin
         nvl2 (sys_context(''USERENV'', ''PROXY_USER''), sys_context(''USERENV'', ''PROXY_USER'') || ''['' || user || '']'', user),
         :sid_
     )'
-    using P_LOG_ID,filial_id_, in_comment_text, procedure_name_, sid_
-    ;
+    using P_LOG_ID,filial_id_, in_comment_text, procedure_name_, sys_context('userenv', 'sid');
+    if p_Copy2dbms_output=1 then 
+      dbms_output.put_line(in_comment_text);
+    end if;
+
+    dbms_application_info.set_action('jblg_jblg_id='||P_LOG_ID); 
     commit;
 end;
 
+-------------------------------------------------------------------------------------------------------------------
 procedure end_log_internal(in_error varchar2 default(null), owner_ VARCHAR2, name_ varchar2)
 is
     pragma autonomous_transaction;
@@ -223,11 +243,13 @@ begin
     ;
     commit;
 
+    dbms_application_info.set_client_info(''); --psv
+    dbms_application_info.set_action('');      -- psv
     -- Сбрасываем текущий идентфикатор, чтобы больше ничего не писалось в детальные логи.
     P_LOG_ID := null;
 end;
 
-
+-------------------------------------------------------------------------------------------------------------------------
 procedure end_log(in_error varchar2 default(null))
 is
     pragma autonomous_transaction;
@@ -240,6 +262,7 @@ begin
     end_log_internal(in_error, owner_, name_);
 end;
 
+-------------------------------------------------------------------------------------------------------------------------
 procedure end_log_with_error(in_error varchar2)
 is
     pragma autonomous_transaction;
@@ -253,6 +276,7 @@ begin
 end;
 
 
+-------------------------------------------------------------------------------------------------------------------------
 procedure write_detail_log(in_comment_text varchar2, in_rows_processed number default(0))
 is
     pragma autonomous_transaction;
@@ -266,12 +290,12 @@ begin
 
     -- Если процедура вызвана до того, как создан основной лог, сигнализируем об ошибке
     if P_LOG_ID is null then
-        write_log_internal(P_LOG_ERROR_ID, owner_, name_, 'Вызван write_detail_log без start_log, текст комментария: '||in_comment_text, in_rows_processed);
+        write_log_internal(P_LOG_ERROR_ID, owner_, name_, in_comment_text, in_rows_processed);
         return;
     end if;
     write_log_internal(P_LOG_ID, owner_, name_, in_comment_text, in_rows_processed);
 end;
 
 
-end job_log;
+end;
 /
